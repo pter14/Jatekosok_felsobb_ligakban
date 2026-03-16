@@ -1,21 +1,19 @@
-# improved_teams_debug.py
-import requests, re, unicodedata, html
+# improved_teams_debug2.py
+import requests, re, unicodedata, html, sys
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, urlunparse
 from ftfy import fix_text
+import chardet
 from difflib import SequenceMatcher
-import chardet   # pip install chardet
-import sys
 
 HEADERS = {"User-Agent":"Mozilla/5.0 (compatible; mlsz-team-list-check/1.0; +you@example.com)"}
 
 def fetch_bytes(url):
     r = requests.get(url, headers=HEADERS, timeout=20)
     r.raise_for_status()
-    return r.content, r.headers.get('content-type', ''), r.apparent_encoding
+    return r.content, r.headers.get('content-type',''), r.apparent_encoding
 
 def try_decodes(content_bytes, apparent_enc):
-    # try sequence: apparent, chardet detection, utf-8, windows-1250, iso-8859-2, latin1
     candidates = []
     if apparent_enc:
         candidates.append(apparent_enc)
@@ -23,11 +21,9 @@ def try_decodes(content_bytes, apparent_enc):
     if detected and detected not in candidates:
         candidates.append(detected)
     candidates += ["utf-8", "windows-1250", "iso-8859-2", "latin1"]
-    seen = set()
-    results = []
+    seen = set(); results=[]
     for enc in candidates:
-        if not enc or enc.lower() in seen:
-            continue
+        if not enc or enc.lower() in seen: continue
         seen.add(enc.lower())
         try:
             txt = content_bytes.decode(enc, errors='strict')
@@ -38,36 +34,23 @@ def try_decodes(content_bytes, apparent_enc):
                 results.append((enc+"-replace", txt))
             except Exception:
                 pass
-    # final fallback
-    txt = content_bytes.decode("utf-8", errors='replace')
-    results.append(("utf-8-replace-final", txt))
+    txt = content_bytes.decode("utf-8", errors='replace'); results.append(("utf-8-replace-final", txt))
     return results
 
-def make_soup_from_best(content_bytes, apparent_enc):
-    decs = try_decodes(content_bytes, apparent_enc)
-    # pick best candidate by heuristic: contains common Hungarian characters or 'Szervező' or 'Csapat'
+def pick_best_decode(decs):
     best = None
     for enc, txt in decs:
         score = 0
-        if "Szervez" in txt or "Csapat" in txt or "Részt" in txt or "Csapatok" in txt:
-            score += 10
-        # presence of Hungarian accented vowels
-        if re.search(r"[áéíóöőúüűÁÉÍÓÖŐÚÜŰ]", txt):
-            score += 5
-        if best is None or score > best[0]:
-            best = (score, enc, txt)
-    # fallback to first if none matched
-    if best is None:
-        enc, txt = decs[0]
-        return BeautifulSoup(txt, "html.parser"), enc
-    _, enc, txt = best
-    return BeautifulSoup(txt, "html.parser"), enc
+        if "Szervez" in txt or "Csapat" in txt or "Részt" in txt or "Csapatok" in txt: score += 10
+        if re.search(r"[áéíóöőúüűÁÉÍÓÖŐÚÜŰ]", txt): score += 5
+        if best is None or score > best[0]: best = (score, enc, txt)
+    if best is None: return decs[0][1], decs[0][0]
+    return best[2], best[1]
 
 def fix_text_final(s):
-    if not s:
-        return s
-    s2 = fix_text(s)            # fix mojibake
-    s2 = html.unescape(s2)      # unescape HTML entities
+    if not s: return s
+    s2 = fix_text(s)
+    s2 = html.unescape(s2)
     s2 = s2.replace("\xa0", " ")
     s2 = unicodedata.normalize("NFKC", s2)
     s2 = re.sub(r"\s+", " ", s2).strip()
@@ -84,98 +67,140 @@ def canonical_url(u):
 def similar(a,b):
     return SequenceMatcher(None, a, b).ratio()
 
-def find_candidate_container(soup):
-    # look for headings that likely introduce the team list
-    headings = soup.find_all(re.compile('^h[1-6]$'))
-    for h in headings:
-        txt = h.get_text(" ", strip=True)
-        if txt and re.search(r"Csapat|Csapatok|Résztvev|Résztvevők|Résztvevok", txt, flags=re.I):
-            return h.find_parent() or h
-    # fallback: look for tables or ULs with many links
-    candidates = soup.find_all(['table','ul','div'])
-    best = None
-    for c in candidates:
-        links = c.find_all('a', href=True)
-        if len(links) >= 6:
-            # prefer elements that contain 'csapat' near them
-            txt = c.get_text(" ", strip=True)
-            score = len(links)
-            if re.search(r"Csapat", txt, flags=re.I):
-                score += 5
-            if best is None or score > best[0]:
-                best = (score, c)
-    if best:
-        return best[1]
-    return None
-
-def extract_team_links_from_container(container, base_url):
-    out = []
-    for a in container.find_all('a', href=True):
-        href = a['href']
+def extract_from_links(soup, base_url):
+    out=[]
+    for a in soup.find_all("a", href=True):
+        href=a['href']
         if re.search(r"/team/|/club/|/csapat/", href, flags=re.I):
-            full = urljoin(base_url, href)
-            raw = a.get_text(" ", strip=True) or a.get('title') or ""
-            name = fix_text_final(raw)
-            if name and len(name) >= 2:
-                out.append({'name': name, 'url': full, 'raw': raw})
+            full=urljoin(base_url, href)
+            raw=a.get_text(" ", strip=True) or a.get("title") or ""
+            name=fix_text_final(raw)
+            if name and len(name)>1:
+                out.append({'name':name,'url':full,'source':'link'})
+    return out
+
+def extract_from_tables(soup, base_url):
+    out=[]
+    # look into tables: find TDs that look like team names (contain uppercase words and SE/FC)
+    tables=soup.find_all("table")
+    for t in tables:
+        for td in t.find_all("td"):
+            txt = td.get_text(" ", strip=True)
+            if not txt: continue
+            candidate = txt.strip()
+            # heuristics: contains 'SE' or 'FC' or consists of words with capital letters or U-..
+            if re.search(r"\b(SE|FC|SC|KSE|SE\.)\b", candidate, flags=re.I) or re.search(r"\bU-\d{1,2}\b", candidate) is None and re.search(r"[A-ZÁÉÍÓÖŐÚÜŰ]{2,}", candidate):
+                name = fix_text_final(candidate)
+                if name and len(name)>2:
+                    out.append({'name':name,'url':base_url,'source':'table_td'})
+    return out
+
+def extract_from_lists(soup, base_url):
+    out=[]
+    for ul in soup.find_all(["ul","ol"]):
+        for li in ul.find_all("li"):
+            txt=li.get_text(" ", strip=True)
+            if not txt: continue
+            if len(txt)>3 and re.search(r"[A-Za-zÁÉÍÓÖŐÚÜŰ]", txt):
+                name=fix_text_final(txt)
+                out.append({'name':name,'url':base_url,'source':'list_li'})
+    return out
+
+def extract_from_scripts(raw_html, base_url):
+    out=[]
+    # try to find JSON arrays with names
+    # pattern: ["Mezőhegyes","Másik csapat"...]  or "teams":[{...,"name":"..."}]
+    for m in re.finditer(r'(\[.*?Mez.*?\])', raw_html, flags=re.S|re.I):
+        try:
+            arr_text = m.group(1)
+            # crude extraction of quoted words
+            names = re.findall(r'"([^"]{3,})"', arr_text)
+            for n in names:
+                nm = fix_text_final(n)
+                out.append({'name':nm,'url':base_url,'source':'script_array'})
+        except Exception:
+            pass
+    # teams objects
+    for m in re.finditer(r'"teams"\s*:\s*\[([^\]]+)\]', raw_html, flags=re.S|re.I):
+        block = m.group(1)
+        names = re.findall(r'"name"\s*:\s*"([^"]{3,})"', block)
+        for n in names:
+            nm=fix_text_final(n)
+            out.append({'name':nm,'url':base_url,'source':'script_obj'})
     return out
 
 def intelligent_dedupe(candidates):
-    # dedupe by canonical_url first, then by normalized name fuzzy merging
-    by_url = {}
+    # by canonical_url + fuzzy name merging
+    by_url={}
     for c in candidates:
-        key = canonical_url(c['url'])
+        key=canonical_url(c.get('url', ''))
         if key not in by_url:
-            by_url[key] = c
-    uniq = list(by_url.values())
-    # now further dedupe by fuzzy name: merge if similarity > 0.88
-    merged = []
-    used = [False]*len(uniq)
-    for i, a in enumerate(uniq):
-        if used[i]:
-            continue
-        group = [a]
-        used[i] = True
-        for j in range(i+1, len(uniq)):
-            if used[j]:
-                continue
-            b = uniq[j]
-            # compare lower-case fixed names without punctuation
-            na = re.sub(r"[^\w\s]", "", a['name'].lower())
-            nb = re.sub(r"[^\w\s]", "", b['name'].lower())
-            if similar(na, nb) > 0.88:
-                group.append(b)
-                used[j] = True
-        # pick the "best" representative: prefer one whose raw text appears longer (likely full name)
-        rep = sorted(group, key=lambda x: len(x.get('name','')) , reverse=True)[0]
+            by_url[key]=c
+    uniq=list(by_url.values())
+    merged=[]; used=[False]*len(uniq)
+    for i,a in enumerate(uniq):
+        if used[i]: continue
+        group=[a]; used[i]=True
+        for j in range(i+1,len(uniq)):
+            if used[j]: continue
+            b=uniq[j]
+            na=re.sub(r"[^\w\s]", "", a['name'].lower())
+            nb=re.sub(r"[^\w\s]", "", b['name'].lower())
+            if similar(na, nb) > 0.86:
+                group.append(b); used[j]=True
+        rep = sorted(group, key=lambda x: len(x.get('name','')), reverse=True)[0]
         merged.append(rep)
     return merged
 
-def list_unique_teams(url):
-    content_bytes, content_type, apparent_enc = fetch_bytes(url)
-    soup, used_enc = make_soup_from_best(content_bytes, apparent_enc)
-    container = find_candidate_container(soup)
-    debug = {}
-    if container is None:
-        # fallback to whole page
-        container = soup
-        debug['container_hint'] = 'page'
-    else:
-        debug['container_hint'] = 'found_heading_or_block'
-    candidates = extract_team_links_from_container(container, url)
-    debug['raw_count'] = len(candidates)
-    uniq = intelligent_dedupe(candidates)
+def main(url):
+    content_bytes, content_type, apparent = fetch_bytes(url)
+    decs = try_decodes(content_bytes, apparent)
+    txt, used_enc = pick_best_decode(decs)
+    soup = BeautifulSoup(txt, "html.parser")
+    raw_html = txt
+
+    results=[]
+    debug = {'used_encoding': used_enc, 'found_link_hits': False, 'found_table_hits': False, 'found_list_hits': False, 'found_script_hits': False}
+
+    # 1) links
+    links = extract_from_links(soup, url)
+    if links:
+        debug['found_link_hits'] = True
+        results.extend(links)
+
+    # 2) tables
+    tables = extract_from_tables(soup, url)
+    if tables:
+        debug['found_table_hits'] = True
+        results.extend(tables)
+
+    # 3) lists
+    lists = extract_from_lists(soup, url)
+    if lists:
+        debug['found_list_hits'] = True
+        results.extend(lists)
+
+    # 4) scripts / JSON
+    scripts = extract_from_scripts(raw_html, url)
+    if scripts:
+        debug['found_script_hits'] = True
+        results.extend(scripts)
+
+    debug['raw_candidate_count'] = len(results)
+    uniq = intelligent_dedupe(results)
     debug['unique_count'] = len(uniq)
-    debug['used_encoding'] = used_enc
-    return uniq, debug
+
+    print("DEBUG:", debug)
+    print("SAMPLE candidates (max 50):")
+    for i, t in enumerate(results[:50],1):
+        print(f"{i:2d}. [{t.get('source')}] {t.get('name')!r} -> {t.get('url')}")
+    print("\nUNIQUE FINAL:")
+    for i, t in enumerate(uniq,1):
+        print(f"{i:2d}. {t.get('name')!r} -> {t.get('url')}")
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        url = sys.argv[1]
+    if len(sys.argv)>1:
+        url=sys.argv[1]
     else:
-        url = "https://adatbank.mlsz.hu/league/65/3/32058/10.html"
-    uniq, debug = list_unique_teams(url)
-    print("DEBUG:", debug)
-    print("UNIQUE TEAMS:", len(uniq))
-    for i, t in enumerate(uniq, 1):
-        print(f"{i:2d}. {t['name']} -> {t['url']}")
+        url="https://adatbank.mlsz.hu/league/65/3/32058/10.html"
+    main(url)
